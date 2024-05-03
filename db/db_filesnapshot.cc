@@ -4,7 +4,6 @@
 //  (found in the LICENSE.Apache file in the root directory).
 //
 
-
 #include <algorithm>
 #include <cstdint>
 #include <memory>
@@ -288,6 +287,17 @@ Status DBImpl::GetLiveFilesStorageInfo(
   const uint64_t options_size = versions_->options_file_size_;
   const uint64_t min_log_num = MinLogNumberToKeep();
 
+  // If there is an active log writer, capture current log number and its current
+  // size (excluding incomplete records at the log tail), in order to return
+  // size of the current WAL file in a consistent state.
+  log_write_mutex_.Lock();
+  const uint64_t current_log_num = logfile_number_;
+  // With `manual_wal_flush` enabled, this value can include some buffered data.
+  // But we're calling `FlushWAL()` below, so it won't be a problem.
+  const uint64_t current_log_aligned_len =
+      logs_.empty() ? 0 : logs_.back().writer->get_latest_complete_record_offset();
+  log_write_mutex_.Unlock();
+
   mutex_.Unlock();
 
   std::string manifest_fname = DescriptorFileName(manifest_number);
@@ -370,6 +380,8 @@ Status DBImpl::GetLiveFilesStorageInfo(
     return s;
   }
 
+  TEST_SYNC_POINT("DBImpl::GetLiveFilesStorageInfo:AfterGettingLiveWalFiles");
+
   size_t wal_size = live_wal_files.size();
 
   ROCKS_LOG_INFO(immutable_db_options_.info_log,
@@ -379,19 +391,34 @@ Status DBImpl::GetLiveFilesStorageInfo(
   // that has changes after the last flush.
   auto wal_dir = immutable_db_options_.GetWalDir();
   for (size_t i = 0; s.ok() && i < wal_size; ++i) {
+    const uint64_t log_num = live_wal_files[i]->LogNumber();
+    // Indicates whether this is a new WAL, created after we've captured current
+    // log number under the mutex.
+    const bool new_wal = current_log_num != 0 && log_num > current_log_num;
     if ((live_wal_files[i]->Type() == kAliveLogFile) &&
-        (!flush_memtable || live_wal_files[i]->LogNumber() >= min_log_num)) {
+        (!flush_memtable || log_num >= min_log_num) &&
+        !new_wal) {
       results.emplace_back();
       LiveFileStorageInfo& info = results.back();
       auto f = live_wal_files[i]->PathName();
       assert(!f.empty() && f[0] == '/');
       info.relative_filename = f.substr(1);
       info.directory = wal_dir;
-      info.file_number = live_wal_files[i]->LogNumber();
+      info.file_number = log_num;
       info.file_type = kWalFile;
-      info.size = live_wal_files[i]->SizeFileBytes();
-      // Only last should need to be trimmed
-      info.trim_to_size = (i + 1 == wal_size);
+      if (current_log_num == info.file_number) {
+        // Data can be written into the current log file while we're taking a
+        // checkpoint, so we need to copy it and trim its size to the consistent
+        // state, captured under the mutex.
+        info.size = current_log_aligned_len;
+        info.trim_to_size = true;
+      } else {
+        info.size = live_wal_files[i]->SizeFileBytes();
+        // Trim the log if log file recycling is enabled. In this case, a hard
+        // link doesn't prevent the file from being renamed and recycled.
+        // So we need to copy it instead.
+        info.trim_to_size = immutable_db_options_.recycle_log_file_num > 0;
+      }
       if (opts.include_checksum_info) {
         info.file_checksum_func_name = kUnknownFileChecksumFuncName;
         info.file_checksum = kUnknownFileChecksum;

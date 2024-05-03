@@ -978,6 +978,138 @@ TEST_F(CheckpointTest, PutRaceWithCheckpointTrackedWalSync) {
   Close();
 }
 
+// Parameterized checkpoint test.
+// Parameters are (manual WAL flush, compression type).
+class CheckpointTestWithParams
+    : public CheckpointTest,
+      public ::testing::WithParamInterface<std::tuple<bool, CompressionType>> {
+ public:
+  CheckpointTestWithParams() : CheckpointTest() {}
+
+  Options GetOptionsFromParam() {
+    Options options = CurrentOptions();
+    const auto param = GetParam();
+    options.manual_wal_flush = std::get<0>(param);
+    options.wal_compression = std::get<1>(param);
+
+    return options;
+  }
+};
+
+INSTANTIATE_TEST_CASE_P(
+    Checkpoint, CheckpointTestWithParams,
+    ::testing::Combine(::testing::Bool(),
+                       ::testing::Values(CompressionType::kNoCompression,
+                                         CompressionType::kZSTD)));
+
+// Reproduces a race condition, where checkpoint operation gets size of the active
+// WAL using stat, when WAL is in inconsistent state - when last write to the
+// file appended a non-last fragment of a record.
+// Such checkpoint cannot be recovered with WAL recovery mode `kAbsoluteConsistency`,
+// if WAL is copied as-is.
+// It fails with 'error reading trailing data due to encountering EOF'
+TEST_P(CheckpointTestWithParams, CheckpointWithFragmentedRecordInWal) {
+  Options options = GetOptionsFromParam();
+  options.wal_recovery_mode = WALRecoveryMode::kAbsoluteConsistency;
+  // For simplicity of this test, reduce buffer size.
+  // Buffer size needs to be smaller than the size of data we put during
+  // checkpoint, so that record fragments get flushed to the file once buffer
+  // reaches its limit.
+  // This race condition can be reproduced with default 1M buffer size, too.
+  // It just needs more data inserted into the database in such case.
+  options.writable_file_max_buffer_size = log::kBlockSize / 2;
+
+  Reopen(options);
+
+  Random rnd(42);
+
+  ASSERT_OK(Put("foo1", rnd.RandomString(1024)));
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->LoadDependency({
+      {"CheckpointImpl::CreateCustomCheckpoint:AfterGetLive1",
+       "CheckpointTest::CheckpointWithFragmentedRecordInWal:BeforePut"},
+      {"Writer::AddRecord:BeforeLastFragmentWrite1",
+       "CheckpointImpl::CreateCustomCheckpoint:AfterGetLive2"},
+      {"DBImpl::GetLiveFilesStorageInfo:AfterGettingLiveWalFiles",
+       "Writer::AddRecord:BeforeLastFragmentWrite2"},
+  });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  std::function<void()> create_checkpoint_func = [&]() {
+    std::unique_ptr<Checkpoint> checkpoint;
+    Checkpoint* checkpoint_ptr;
+    ASSERT_OK(Checkpoint::Create(db_, &checkpoint_ptr));
+    checkpoint.reset(checkpoint_ptr);
+    const uint64_t wal_size_for_flush = std::numeric_limits<uint64_t>::max();
+    ASSERT_OK(checkpoint->CreateCheckpoint(snapshot_name_,  wal_size_for_flush));
+  };
+
+  port::Thread create_checkpoint_thread(create_checkpoint_func);
+
+  TEST_SYNC_POINT("CheckpointTest::CheckpointWithFragmentedRecordInWal:BeforePut");
+  ASSERT_OK(Put("foo2", rnd.RandomString(log::kBlockSize)));
+
+  create_checkpoint_thread.join();
+
+  Close();
+
+  DB* snapshot_db = nullptr;
+  ASSERT_OK(DB::Open(options, snapshot_name_, &snapshot_db));
+  ASSERT_OK(snapshot_db->Close());
+  delete snapshot_db;
+}
+
+// Reproduces a race condition, where checkpoint operation gets size of the active
+// WAL using stat, when WAL is in inconsistent state - when last write to the
+// file appended an incomplete fragment of a record.
+// Such checkpoint cannot be recovered with WAL recovery mode `kAbsoluteConsistency`,
+// if WAL is copied as-is.
+// It fails with 'truncated record body' error.
+TEST_P(CheckpointTestWithParams, CheckpointWithTruncatedRecordBodyInWal) {
+  Options options = GetOptionsFromParam();
+  options.wal_recovery_mode = WALRecoveryMode::kAbsoluteConsistency;
+  options.writable_file_max_buffer_size = log::kBlockSize / 4;
+
+  Reopen(options);
+
+  Random rnd(42);
+
+  ASSERT_OK(Put("foo1", rnd.RandomString(1024)));
+
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->LoadDependency({
+      {"CheckpointImpl::CreateCustomCheckpoint:AfterGetLive1",
+       "CheckpointTest::CheckpointWithTruncatedRecordBodyInWal:BeforePut"},
+      {"WritableFileWriter::Append:FlushAfterBufferCapacityLimitReached1",
+       "CheckpointImpl::CreateCustomCheckpoint:AfterGetLive2"},
+      {"DBImpl::GetLiveFilesStorageInfo:AfterGettingLiveWalFiles",
+       "WritableFileWriter::Append:FlushAfterBufferCapacityLimitReached2"},
+  });
+  ROCKSDB_NAMESPACE::SyncPoint::GetInstance()->EnableProcessing();
+
+  std::function<void()> create_checkpoint_func = [&]() {
+    std::unique_ptr<Checkpoint> checkpoint;
+    Checkpoint* checkpoint_ptr;
+    ASSERT_OK(Checkpoint::Create(db_, &checkpoint_ptr));
+    checkpoint.reset(checkpoint_ptr);
+    const uint64_t wal_size_for_flush = std::numeric_limits<uint64_t>::max();
+    ASSERT_OK(checkpoint->CreateCheckpoint(snapshot_name_,  wal_size_for_flush));
+  };
+
+  port::Thread create_checkpoint_thread(create_checkpoint_func);
+
+  TEST_SYNC_POINT("CheckpointTest::CheckpointWithTruncatedRecordBodyInWal:BeforePut");
+  ASSERT_OK(Put("foo2", rnd.RandomString(log::kBlockSize / 4)));
+
+  create_checkpoint_thread.join();
+
+  Close();
+
+  DB* snapshot_db = nullptr;
+  ASSERT_OK(DB::Open(options, snapshot_name_, &snapshot_db));
+  ASSERT_OK(snapshot_db->Close());
+  delete snapshot_db;
+}
+
 }  // namespace ROCKSDB_NAMESPACE
 
 int main(int argc, char** argv) {

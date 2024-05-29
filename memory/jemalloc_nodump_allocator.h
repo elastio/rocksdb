@@ -8,6 +8,7 @@
 #include <atomic>
 #include <vector>
 
+#include "rocksdb/convenience.h"
 #include "port/jemalloc_helper.h"
 #include "port/port.h"
 #include "rocksdb/memory_allocator.h"

@@ -10,7 +10,6 @@
 
 #include "port/likely.h"
 #include "port/port.h"
-#include "rocksdb/convenience.h"
 #include "rocksdb/utilities/customizable_util.h"
 #include "rocksdb/utilities/object_registry.h"
 #include "rocksdb/utilities/options_type.h"
